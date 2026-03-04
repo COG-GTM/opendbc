@@ -2,6 +2,7 @@ import math
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, apply_hysteresis, structs
+from opendbc.car.carlog import carlog
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.ford import fordcan
 from opendbc.car.ford.values import CarControllerParams, FordFlags, CAR
@@ -75,6 +76,11 @@ class CarController(CarControllerBase):
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
 
+    # previous-frame values for change-based decision tracing
+    self._prev_lat_mode = None
+    self._prev_brake_request = None
+    self._prev_long_active = None
+
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
@@ -105,6 +111,7 @@ class CarController(CarControllerBase):
       if self.CP.carFingerprint in (CAR.FORD_BRONCO_SPORT_MK1, CAR.FORD_F_150_MK14):
         self.anti_overshoot_curvature_last = anti_overshoot(actuators.curvature, self.anti_overshoot_curvature_last, CS.out.vEgoRaw)
         apply_curvature = self.anti_overshoot_curvature_last
+        carlog.debug(f"lat_path=anti_overshoot raw_curvature={actuators.curvature:.5f} smoothed_curvature={apply_curvature:.5f}")
       else:
         apply_curvature = actuators.curvature
 
@@ -124,8 +131,15 @@ class CarController(CarControllerBase):
         mode = 1 if CC.latActive else 0
         counter = (self.frame // CarControllerParams.STEER_STEP) % 0x10
         can_sends.append(fordcan.create_lat_ctl2_msg(self.packer, self.CAN, mode, 0., 0., -self.apply_curvature_last, 0., counter))
+        if mode != self._prev_lat_mode:
+          carlog.debug(f"lat_control=CANFD mode={mode} curvature={-self.apply_curvature_last:.5f}")
+          self._prev_lat_mode = mode
       else:
         can_sends.append(fordcan.create_lat_ctl_msg(self.packer, self.CAN, CC.latActive, 0., 0., -self.apply_curvature_last, 0.))
+        lat_mode = 1 if CC.latActive else 0
+        if lat_mode != self._prev_lat_mode:
+          carlog.debug(f"lat_control=CAN latActive={CC.latActive} curvature={-self.apply_curvature_last:.5f}")
+          self._prev_lat_mode = lat_mode
 
     # send lka msg at 33Hz
     if (self.frame % CarControllerParams.LKA_STEP) == 0:
@@ -141,7 +155,10 @@ class CarController(CarControllerBase):
         # Compensate for engine creep at low speed.
         # Either the ABS does not account for engine creep, or the correction is very slow
         # TODO: verify this applies to EV/hybrid
+        raw_accel = accel
         accel = apply_creep_compensation(accel, CS.out.vEgo)
+        if raw_accel != accel:
+          carlog.debug(f"creep_compensation raw_accel={raw_accel:.3f} compensated_accel={accel:.3f} v_ego={CS.out.vEgo:.2f}")
 
         # The stock system has been seen rate limiting the brake accel to 5 m/s^3,
         # however even 3.5 m/s^3 causes some overshoot with a step response.
@@ -160,10 +177,17 @@ class CarController(CarControllerBase):
         accel_due_to_pitch = math.sin(CC.orientationNED[1]) * ACCELERATION_DUE_TO_GRAVITY
 
       accel_pitch_compensated = accel + accel_due_to_pitch
+      prev_brake_request = self.brake_request
       if accel_pitch_compensated > 0.3 or not CC.longActive:
         self.brake_request = False
       elif accel_pitch_compensated < 0.0:
         self.brake_request = True
+      if self.brake_request != prev_brake_request:
+        carlog.debug(f"brake_request={self.brake_request} accel_pitch_compensated={accel_pitch_compensated:.3f} longActive={CC.longActive}")
+
+      if CC.longActive != self._prev_long_active:
+        carlog.debug(f"longActive={CC.longActive} accel={accel:.3f} gas={gas:.3f} brake_request={self.brake_request}")
+        self._prev_long_active = CC.longActive
 
       stopping = CC.actuators.longControlState == LongCtrlState.stopping
       # TODO: look into using the actuators packet to send the desired speed
