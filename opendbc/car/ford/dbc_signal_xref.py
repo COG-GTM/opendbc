@@ -69,7 +69,7 @@ def _infer_usage_from_context(line_text: str, signal_name: str) -> str:
     return assign_match.group(1).replace("ret.", "")
 
   # Handle self.field = ...
-  self_match = re.match(r'(self\.\w+)\s*=', stripped)
+  self_match = re.match(r'(self\.\w+)\s*=(?!=)', stripped)
   if self_match:
     return self_match.group(1).replace("self.", "")
 
