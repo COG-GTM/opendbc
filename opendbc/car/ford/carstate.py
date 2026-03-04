@@ -1,5 +1,6 @@
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
+from opendbc.car.carlog import carlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.values import DBC, CarControllerParams, FordFlags
@@ -20,6 +21,13 @@ class CarState(CarStateBase):
     self.distance_button = 0
     self.lc_button = 0
 
+    # previous-frame values for change-based decision tracing
+    self._prev_epas_failure = None
+    self._prev_lat_ctl_stat = None
+    self._prev_cc_stat = None
+    self._prev_stepin_qf = None
+    self._prev_gear_shifter = None
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -28,7 +36,11 @@ class CarState(CarStateBase):
 
     # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
     # The vehicle usually recovers out of this state within a minute of normal driving
-    ret.vehicleSensorsInvalid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] != 3
+    stepin_qf = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"]
+    ret.vehicleSensorsInvalid = stepin_qf != 3
+    if stepin_qf != self._prev_stepin_qf:
+      carlog.debug(f"StePinCompAnEst_D_Qf={stepin_qf} vehicleSensorsInvalid={ret.vehicleSensorsInvalid}")
+      self._prev_stepin_qf = stepin_qf
 
     # car speed
     ret.vEgoRaw = cp.vl["BrakeSysFeatures"]["Veh_V_ActlBrk"] * CV.KPH_TO_MS
@@ -48,24 +60,36 @@ class CarState(CarStateBase):
     ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
     ret.steeringTorque = cp.vl["EPAS_INFO"]["SteeringColumnTorque"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > CarControllerParams.STEER_DRIVER_ALLOWANCE, 5)
-    ret.steerFaultTemporary = cp.vl["EPAS_INFO"]["EPAS_Failure"] == 1
-    ret.steerFaultPermanent = cp.vl["EPAS_INFO"]["EPAS_Failure"] in (2, 3)
+    epas_failure = cp.vl["EPAS_INFO"]["EPAS_Failure"]
+    ret.steerFaultTemporary = epas_failure == 1
+    ret.steerFaultPermanent = epas_failure in (2, 3)
+    if epas_failure != self._prev_epas_failure:
+      carlog.debug(f"EPAS_Failure={epas_failure} steerFaultTemporary={ret.steerFaultTemporary} steerFaultPermanent={ret.steerFaultPermanent}")
+      self._prev_epas_failure = epas_failure
     ret.espDisabled = cp.vl["Cluster_Info1_FD1"]["DrvSlipCtlMde_D_Rq"] != 0  # 0 is default mode
 
     if self.CP.flags & FordFlags.CANFD:
       # this signal is always 0 on non-CAN FD cars
-      ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
+      lat_ctl_stat = cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"]
+      ret.steerFaultTemporary |= lat_ctl_stat not in (1, 2, 3)
+      if lat_ctl_stat != self._prev_lat_ctl_stat:
+        carlog.debug(f"CANFD LatCtlSte_D_Stat={lat_ctl_stat} steerFaultTemporary={ret.steerFaultTemporary}")
+        self._prev_lat_ctl_stat = lat_ctl_stat
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False
+    cc_stat = cp.vl["EngBrakeData"]["CcStat_D_Actl"]
     ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
-    ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
-    ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
+    ret.cruiseState.enabled = cc_stat in (4, 5)
+    ret.cruiseState.available = cc_stat in (3, 4, 5)
     ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
     ret.cruiseState.standstill = cp.vl["EngBrakeData"]["AccStopMde_D_Rq"] == 3
-    ret.accFaulted = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (1, 2)
+    ret.accFaulted = cc_stat in (1, 2)
     if not self.CP.openpilotLongitudinalControl:
       ret.accFaulted = ret.accFaulted or cp_cam.vl["ACCDATA"]["CmbbDeny_B_Actl"] == 1
+    if cc_stat != self._prev_cc_stat:
+      carlog.debug(f"CcStat_D_Actl={cc_stat} enabled={ret.cruiseState.enabled} available={ret.cruiseState.available} accFaulted={ret.accFaulted}")
+      self._prev_cc_stat = cc_stat
 
     # gear
     if self.CP.transmissionType == TransmissionType.automatic:
@@ -76,6 +100,9 @@ class CarState(CarStateBase):
         ret.gearShifter = GearShifter.reverse
       else:
         ret.gearShifter = GearShifter.drive
+    if ret.gearShifter != self._prev_gear_shifter:
+      carlog.debug(f"transmissionType={self.CP.transmissionType} gearShifter={ret.gearShifter}")
+      self._prev_gear_shifter = ret.gearShifter
 
     # safety
     ret.stockFcw = bool(cp_cam.vl["ACCDATA_3"]["FcwVisblWarn_B_Rq"])
@@ -99,8 +126,10 @@ class CarState(CarStateBase):
     # blindspot sensors
     if self.CP.enableBsm:
       cp_bsm = cp_cam if self.CP.flags & FordFlags.CANFD else cp
+      bsm_source = "cam" if self.CP.flags & FordFlags.CANFD else "pt"
       ret.leftBlindspot = cp_bsm.vl["Side_Detect_L_Stat"]["SodDetctLeft_D_Stat"] != 0
       ret.rightBlindspot = cp_bsm.vl["Side_Detect_R_Stat"]["SodDetctRight_D_Stat"] != 0
+      carlog.debug(f"BSM source={bsm_source} leftBlindspot={ret.leftBlindspot} rightBlindspot={ret.rightBlindspot}")
 
     # Stock steering buttons so that we can passthru blinkers etc.
     self.buttons_stock_values = cp.vl["Steering_Data_FD1"]
