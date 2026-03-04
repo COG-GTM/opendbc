@@ -78,7 +78,6 @@ class CarController(CarControllerBase):
 
     # previous-frame values for change-based decision tracing
     self._prev_lat_mode = None
-    self._prev_brake_request = None
     self._prev_long_active = None
 
   def update(self, CC, CS, now_nanos):
