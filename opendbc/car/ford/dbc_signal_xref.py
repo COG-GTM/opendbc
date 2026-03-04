@@ -57,15 +57,16 @@ def _infer_usage_from_context(line_text: str, signal_name: str) -> str:
   """Infer how a signal is used from the surrounding assignment or expression."""
   stripped = line_text.strip()
 
-  # Handle assignments like: ret.fieldName = ...
-  assign_match = re.match(r'(ret\.\w+)\s*[=|]', stripped)
-  if assign_match:
-    return assign_match.group(1).replace("ret.", "")
-
-  # Handle augmented assignments like: ret.fieldName |= ...
+  # Handle augmented assignments like: ret.fieldName |= ... (check before plain assignment)
   aug_assign_match = re.match(r'(ret\.\w+)\s*\|=', stripped)
   if aug_assign_match:
     return aug_assign_match.group(1).replace("ret.", "")
+
+  # Handle plain assignments like: ret.fieldName = ...
+  # Use (?!=) negative lookahead to avoid matching == comparisons
+  assign_match = re.match(r'(ret\.\w+)\s*=(?!=)', stripped)
+  if assign_match:
+    return assign_match.group(1).replace("ret.", "")
 
   # Handle self.field = ...
   self_match = re.match(r'(self\.\w+)\s*=', stripped)
@@ -213,40 +214,11 @@ def extract_packer_signals(filepath: Path) -> list[tuple[str, str, int, str]]:
               seen.add(key_tuple)
               results.append((primary_msg, signal_name, line_num, "packer"))
 
-      # Also extract from List nodes inside stock_values passthrough comprehensions
-      # Pattern: {s: stock_values[s] for s in ["Signal1", "Signal2", ...]}
-      if isinstance(node, ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp):
-        _extract_from_comprehension(node, primary_msg, results, seen)
-
-    # Also extract from plain List nodes used in stock_values passthrough
-    # Pattern: values = {s: stock_values[s] for s in ["Sig1", ...]}
+    # Extract signal names from stock_values dict comprehension patterns
+    # Pattern: {s: stock_values[s] for s in ["Signal1", "Signal2", ...]}
     _extract_stock_values_from_func(func_node, primary_msg, results, seen)
 
   return results
-
-
-def _extract_from_comprehension(
-  node: ast.expr, msg_name: str,
-  results: list[tuple[str, str, int, str]],
-  seen: set[tuple[str, str, int]],
-) -> None:
-  """Extract signal names from comprehension iterables (e.g. for s in [...])."""
-  iters: list[ast.expr] = []
-  if isinstance(node, ast.DictComp):
-    iters = [comp.iter for comp in node.generators]
-  elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-    iters = [comp.iter for comp in node.generators]
-
-  for iter_node in iters:
-    if isinstance(iter_node, ast.List):
-      for elt in iter_node.elts:
-        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-          signal_name = elt.value
-          line_num = elt.lineno
-          key_tuple = (msg_name, signal_name, line_num)
-          if key_tuple not in seen:
-            seen.add(key_tuple)
-            results.append((msg_name, signal_name, line_num, "stock_passthrough"))
 
 
 def _extract_stock_values_from_func(
