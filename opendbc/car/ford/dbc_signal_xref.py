@@ -58,18 +58,18 @@ def _infer_usage_from_context(line_text: str, signal_name: str) -> str:
   stripped = line_text.strip()
 
   # Handle augmented assignments like: ret.fieldName |= ... (check before plain assignment)
-  aug_assign_match = re.match(r'(ret\.\w+)\s*\|=', stripped)
+  aug_assign_match = re.match(r'(ret\.(?:\w+\.)*\w+)\s*\|=', stripped)
   if aug_assign_match:
     return aug_assign_match.group(1).replace("ret.", "")
 
-  # Handle plain assignments like: ret.fieldName = ...
+  # Handle plain assignments like: ret.fieldName = ... or ret.cruiseState.speed = ...
   # Use (?!=) negative lookahead to avoid matching == comparisons
-  assign_match = re.match(r'(ret\.\w+)\s*=(?!=)', stripped)
+  assign_match = re.match(r'(ret\.(?:\w+\.)*\w+)\s*=(?!=)', stripped)
   if assign_match:
     return assign_match.group(1).replace("ret.", "")
 
   # Handle self.field = ...
-  self_match = re.match(r'(self\.\w+)\s*=(?!=)', stripped)
+  self_match = re.match(r'(self\.(?:\w+\.)*\w+)\s*=(?!=)', stripped)
   if self_match:
     return self_match.group(1).replace("self.", "")
 
