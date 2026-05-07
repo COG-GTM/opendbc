@@ -2,11 +2,14 @@
 """
 DBC signal-to-code cross-reference index builder for Ford.
 
-Parses carstate.py and carcontroller.py to extract every cp.vl[<msg>][<signal>]
-access and links each to the corresponding signal definition in the Ford DBC file.
+Parses carstate.py, carcontroller.py, and fordcan.py to extract every CAN signal
+reference and links each to the corresponding signal definition in the Ford DBC
+file (ford_lincoln_base_pt). carstate.py and carcontroller.py are walked for
+cp.vl[<msg>][<signal>] reads; fordcan.py is walked for packer-side writes
+(signal-name keys passed to packer.make_can_msg).
 
-Outputs a structured JSON mapping that allows an agent to correlate raw CAN frame bits
-with the code decisions they feed into.
+Outputs a structured JSON mapping keyed by MessageName.SignalName that allows an
+agent to correlate raw CAN frame bits with the code decisions they feed into.
 
 Usage:
   python -m opendbc.car.ford.dbc_signal_xref [--output path/to/output.json]
@@ -53,8 +56,88 @@ def _relative_path(filepath: Path) -> str:
   return filepath.name
 
 
+def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+  """Build a map from each AST node id to its parent."""
+  parents: dict[int, ast.AST] = {}
+  for parent in ast.walk(tree):
+    for child in ast.iter_child_nodes(parent):
+      parents[id(child)] = parent
+  return parents
+
+
+def _ast_dotted_name(node: ast.AST) -> str | None:
+  """Extract a dotted attribute name from an AST node (e.g. 'ret.cruiseState.speed')."""
+  parts: list[str] = []
+  cur: ast.AST = node
+  while isinstance(cur, ast.Attribute):
+    parts.append(cur.attr)
+    cur = cur.value
+  if isinstance(cur, ast.Name):
+    parts.append(cur.id)
+    return ".".join(reversed(parts))
+  return None
+
+
+def _strip_obj_prefix(name: str) -> str:
+  """Strip leading 'ret.' or 'self.' from a dotted attribute name."""
+  for prefix in ("ret.", "self."):
+    if name.startswith(prefix):
+      return name[len(prefix):]
+  return name
+
+
+def _infer_usage_from_ast(node: ast.AST, parents: dict[int, ast.AST], signal_name: str) -> str:
+  """Walk up parent nodes from a vl-access node to find the enclosing statement.
+
+  Resolves the most informative usage label across multi-line expressions, local
+  variable assignments, conditionals, and returns. Falls back to the raw signal
+  name only when no enclosing statement is reachable.
+  """
+  cur: ast.AST = node
+  while id(cur) in parents:
+    cur = parents[id(cur)]
+
+    if isinstance(cur, ast.Assign):
+      # Use the first target's dotted name (e.g. ret.cruiseState.speed, gear, is_metric)
+      target = cur.targets[0] if cur.targets else None
+      if target is not None:
+        name = _ast_dotted_name(target)
+        if name:
+          return _strip_obj_prefix(name)
+      break
+
+    if isinstance(cur, (ast.AugAssign, ast.AnnAssign)):
+      name = _ast_dotted_name(cur.target)
+      if name:
+        return _strip_obj_prefix(name)
+      break
+
+    # ``If``/``While`` are control-flow statements: reaching one as the first
+    # enclosing statement means the vl access lives in the test (any access in
+    # the body would be wrapped by an inner statement we'd hit first).
+    # ``IfExp`` (ternary) is intentionally skipped here — it's a value-producing
+    # expression that's part of a larger statement (typically an Assign), so we
+    # keep walking to find the real target.
+    if isinstance(cur, (ast.If, ast.While)):
+      return "condition"
+
+    if isinstance(cur, ast.Return):
+      return "return"
+
+    # Stop at function/class boundaries
+    if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+      break
+
+  return signal_name
+
+
 def _infer_usage_from_context(line_text: str, signal_name: str) -> str:
-  """Infer how a signal is used from the surrounding assignment or expression."""
+  """Regex fallback for usage inference (used by the regex-scanning path).
+
+  AST-based inference is preferred (see ``_infer_usage_from_ast``); this routine
+  only runs for matches discovered by the line-by-line regex scan after a
+  SyntaxError, or for patterns the AST walk would not reach.
+  """
   stripped = line_text.strip()
 
   # Handle augmented assignments like: ret.fieldName |= ... (check before plain assignment)
@@ -98,6 +181,7 @@ def extract_vl_accesses(filepath: Path) -> list[tuple[str, str, int, str]]:
   # AST-based extraction for reliable parsing
   try:
     tree = ast.parse(source, filename=str(filepath))
+    parents = _build_parent_map(tree)
     for node in ast.walk(tree):
       # Look for pattern: <expr>.vl["MsgName"]["SignalName"]
       if not isinstance(node, ast.Subscript):
@@ -122,8 +206,7 @@ def extract_vl_accesses(filepath: Path) -> list[tuple[str, str, int, str]]:
         continue
 
       line_num = node.lineno
-      line_text = lines[line_num - 1] if line_num <= len(lines) else ""
-      usage = _infer_usage_from_context(line_text, signal_key)
+      usage = _infer_usage_from_ast(node, parents, signal_key)
 
       key = (msg_key, signal_key, line_num)
       if key not in seen:

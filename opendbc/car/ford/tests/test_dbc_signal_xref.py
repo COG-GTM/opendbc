@@ -75,6 +75,87 @@ class TestExtractVlAccesses:
     results = extract_vl_accesses(src)
     assert results == []
 
+  def test_multiline_continuation(self, tmp_path: Path):
+    """Signals on continuation lines of a multi-line assignment should
+    inherit the assignment target as their usage label, not fall back to
+    the raw signal name."""
+    src = tmp_path / "test_multiline.py"
+    src.write_text(textwrap.dedent("""\
+      ret.doorOpen = any([cp.vl["BodyInfo_3_FD1"]["DrStatDrv_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatPsngr_B_Actl"],
+                          cp.vl["BodyInfo_3_FD1"]["DrStatRl_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatRr_B_Actl"]])
+    """))
+    results = extract_vl_accesses(src)
+    usages = {r[1]: r[3] for r in results}
+    assert usages["DrStatDrv_B_Actl"] == "doorOpen"
+    assert usages["DrStatPsngr_B_Actl"] == "doorOpen"
+    assert usages["DrStatRl_B_Actl"] == "doorOpen"
+    assert usages["DrStatRr_B_Actl"] == "doorOpen"
+
+  def test_local_variable_assignment(self, tmp_path: Path):
+    """Plain local-variable assignments (not ret./self.) should use the
+    variable name as the usage label."""
+    src = tmp_path / "test_local.py"
+    src.write_text(textwrap.dedent("""\
+      gear = self.shifter_values.get(cp.vl["PowertrainData_10"]["TrnRng_D_Rq"])
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "gear"
+
+  def test_ternary_assignment(self, tmp_path: Path):
+    """Ternary (IfExp) is a value expression, not control flow — usage
+    should resolve to the enclosing assignment target."""
+    src = tmp_path / "test_ternary.py"
+    src.write_text(textwrap.dedent("""\
+      is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not flag else False
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "is_metric"
+
+  def test_augmented_assignment(self, tmp_path: Path):
+    """``ret.x |= cp.vl[...]`` should resolve to the augmented target."""
+    src = tmp_path / "test_aug.py"
+    src.write_text(textwrap.dedent("""\
+      ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"]
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "steerFaultTemporary"
+
+  def test_annotated_assignment(self, tmp_path: Path):
+    """Annotated assignments (``x: int = cp.vl[...]``) should resolve to
+    the target name."""
+    src = tmp_path / "test_ann.py"
+    src.write_text(textwrap.dedent("""\
+      counter: int = cp.vl["Msg"]["Sig"]
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "counter"
+
+  def test_return_statement(self, tmp_path: Path):
+    """A bare ``return cp.vl[...]`` should resolve to ``return``."""
+    src = tmp_path / "test_return.py"
+    src.write_text(textwrap.dedent("""\
+      def helper(cp):
+        return cp.vl["Msg"]["Sig"]
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "return"
+
+  def test_nested_attribute_assignment(self, tmp_path: Path):
+    """Nested attribute paths like ret.cruiseState.speed should be captured
+    in full (minus the ret. prefix)."""
+    src = tmp_path / "test_nested.py"
+    src.write_text(textwrap.dedent("""\
+      ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"]
+    """))
+    results = extract_vl_accesses(src)
+    assert len(results) == 1
+    assert results[0][3] == "cruiseState.speed"
+
 
 class TestExtractPackerSignals:
   def test_basic_packer_values(self, tmp_path: Path):
