@@ -5,7 +5,7 @@ DBC signal-to-code cross-reference index builder for Ford.
 Parses carstate.py and carcontroller.py to extract every cp.vl[<msg>][<signal>]
 access and links each to the corresponding signal definition in the Ford DBC file.
 
-Outputs a structured JSON mapping that lets an agent correlate raw CAN frame bits
+Outputs a structured JSON mapping that allows an agent to correlate raw CAN frame bits
 with the code decisions they feed into.
 
 Usage:
